@@ -3,9 +3,10 @@ require "logstash/outputs/base"
 require "logstash/namespace"
 require "stud/buffer"
 
-# This output will send events to a Redis queue using RPUSH.
+# This output will send events to a Redis queue using RPUSH/ZADD.
 # The RPUSH command is supported in Redis v0.0.7+. Using
-# PUBLISH to a channel requires at least v1.3.8+.
+# PUBLISH to a channel requires at least v1.3.8+. Using 
+# ZADD is supported in Redis v1.2.0+.
 # While you may be able to make these Redis versions work,
 # the best performance and stability will be found in more
 # recent stable versions.  Versions 2.6.0+ are recommended.
@@ -56,45 +57,58 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
 
   # Either list or channel.  If `redis_type` is list, then we will set
   # RPUSH to key. If `redis_type` is channel, then we will PUBLISH to `key`.
-  config :data_type, :validate => [ "list", "channel" ], :required => true
+  # If `redis_type` is sortedset, then we will ZADD to `key` with weight set
+  # to content of `priority_field`
+  config :data_type, :validate => [ "list", "channel", "sortedset" ], :required => true
 
-  # Set to true if you want Redis to batch up values and send 1 RPUSH command
-  # instead of one command per value to push on the list.  Note that this only
-  # works with `data_type="list"` mode right now.
+  # Set to true if you want Redis to batch up values and send 1 RPUSH or ZADD command
+  # instead of one command per value to push on the list or set.  Note that this only
+  # works with `data_type="list"` and `data_type="sortedset"` mode right now.
   #
-  # If true, we send an RPUSH every "batch_events" events or
+  # If true, we send an RPUSH or ZADD every "batch_events" events or
   # "batch_timeout" seconds (whichever comes first).
-  # Only supported for `data_type` is "list".
+  # Only supported for `data_type` is "list" and "sortedset".
   config :batch, :validate => :boolean, :default => false
 
-  # If batch is set to true, the number of events we queue up for an RPUSH.
+  # If batch is set to true, the number of events we queue up for an RPUSH or ZADD.
   config :batch_events, :validate => :number, :default => 50
 
-  # If batch is set to true, the maximum amount of time between RPUSH commands
+  # If batch is set to true, the maximum amount of time between RPUSH or ZADD commands
   # when there are pending events to flush.
   config :batch_timeout, :validate => :number, :default => 5
 
   # Interval for reconnecting to failed Redis connections
   config :reconnect_interval, :validate => :number, :default => 1
 
-  # In case Redis `data_type` is `list` and has more than `@congestion_threshold` items,
+  # In case Redis `data_type` is `list` or `sortedset` and has more than `@congestion_threshold` items,
   # block until someone consumes them and reduces congestion, otherwise if there are
   # no consumers Redis will run out of memory, unless it was configured with OOM protection.
   # But even with OOM protection, a single Redis list can block all other users of Redis,
   # until Redis CPU consumption reaches the max allowed RAM size.
   # A default value of 0 means that this limit is disabled.
-  # Only supported for `list` Redis `data_type`.
+  # Only supported for `list` and `sortedset` Redis `data_type`.
   config :congestion_threshold, :validate => :number, :default => 0
 
   # How often to check for congestion. Default is one second.
   # Zero means to check on every event.
   config :congestion_interval, :validate => :number, :default => 1
 
+  # Priority field to use for data_type `sortedset`, if field doesn't exist, 
+  # priority will be priority_default The score values should be the string
+  # representation of a double precision floating point number. 
+  # +inf and -inf values are valid values as well. (see https://redis.io/commands/zadd)
+  config :priority_field, :validate => :string, :default => "epoch"
+
+  # Default priority for data_type `sortedset` when priority field is not found in the event.
+  # The score values should be the string representation of a double precision floating point number. 
+  # +inf and -inf values are valid values as well. (see https://redis.io/commands/zadd)
+  config :priority_default, :validate => :number, :default => "-1"
+
   def register
     require 'redis'
 
     if @batch
-      if @data_type != "list"
+      if @data_type != "list" and @data_type != "sortedset"
         raise RuntimeError.new(
           "batch is not supported with data_type #{@data_type}"
         )
@@ -152,7 +166,11 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
     # we should not block due to congestion on close
     # to support this Stud::Buffer#buffer_flush should pass here the :final boolean value.
     congestion_check(key) unless close
-    @redis.rpush(key, events)
+    if @data_type == 'sortedset' then
+      @redis.zadd(key, events.map{ |event| [priorize(event), event] })
+    else
+      @redis.rpush(key, events)
+    end
   end
   # called from Stud::Buffer#buffer_flush when an error occurs
   def on_flush_error(e)
@@ -199,6 +217,30 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
     Redis.new(params)
   end # def connect
 
+  private
+  def priorize(event)
+    if event.is_a?(String) then
+      begin
+        @codec.decode(event) do |event_decoded|
+          event = event_decoded
+        end
+      rescue => e # parse or event creation error
+        @logger.warn("Default priority [" << @priority_default.to_s  << "] used, can't decode event [" << @event << "]")
+        return @priority_default.to_s
+      end
+    end
+
+
+    priority_value=event.get(@priority_field)
+
+    if priority_value.nil? || priority_value.to_s !~ /\A[-+]?[0-9]+(\.[0-9]+)?\z/ then
+      @logger.debug("Default priority [" << @priority_default.to_s  << "] used, field [" << @priority_field << "] doesn't exist or doesn't contain a number")
+      priority_value=@priority_default
+    end
+
+    return priority_value.to_s
+  end
+
   # A string used to identify a Redis instance in log messages
   def identity
     "redis://#{@password}@#{@current_host}:#{@current_port}/#{@db} #{@data_type}:#{@key}"
@@ -208,7 +250,7 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
     # How can I do this sort of thing with codecs?
     key = event.sprintf(@key)
 
-    if @batch && @data_type == 'list' # Don't use batched method for pubsub.
+    if @batch && (@data_type == 'list' or @data_type == 'sortedset') # Don't use batched method for pubsub.
       # Stud::Buffer
       buffer_receive(payload, key)
       return
@@ -219,6 +261,9 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
       if @data_type == 'list'
         congestion_check(key)
         @redis.rpush(key, payload)
+      elsif @data_type == 'sortedset'
+        congestion_check(key)
+        @redis.zadd(key, priorize(event), payload)
       else
         @redis.publish(key, payload)
       end
